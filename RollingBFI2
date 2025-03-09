@@ -1,0 +1,180 @@
+#include <windows.h>
+#include <D3dkmthk.h>
+#include <chrono>
+#include <cmath>
+
+using namespace std::chrono;
+
+const char g_szClassName[] = "RollingBFIwindowClass";
+bool quitProgram = false;
+int scanPosition = 0;
+int screenHeight = 0;
+int screenWidth = 0;
+int scanRadius = 200;  // Base radius of the ellipse (vertical radius)
+int gradientSize = 50; // Width of the gradient transition
+float horizontalEllipseFactor = 0.1f; // Factor to stretch the ellipse horizontally (1.0 = circle)
+int cycleOffset = 100;
+int count = 0;
+bool down = true; 
+
+HBITMAP hBitmap = NULL;
+HWND overlayHwnd = NULL;
+
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CLOSE:
+        quitProgram = true;
+        DestroyWindow(hwnd);
+        break;
+    case WM_DESTROY:
+        quitProgram = true;
+        PostQuitMessage(0);
+        break;
+    default:
+        return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
+// Creates an alpha-blended elliptical mask with a gradient edge
+void UpdateGradientWindow(HWND hwnd, int yCenter) {
+    HDC hdcScreen = GetDC(NULL);
+    HDC hdc = CreateCompatibleDC(hdcScreen);
+
+    if (hBitmap) DeleteObject(hBitmap);
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = screenWidth;
+    bmi.bmiHeader.biHeight = -screenHeight; // Negative for top-down DIB
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* pBits;
+    hBitmap = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
+
+    SelectObject(hdc, hBitmap);
+
+    // Fill the entire bitmap with opaque black.
+    RECT fullRect = { 0, 0, screenWidth, screenHeight };
+    HBRUSH blackBrush = CreateSolidBrush(RGB(0, 0, 0));
+    FillRect(hdc, &fullRect, blackBrush);
+    DeleteObject(blackBrush);
+
+    DWORD* pixels = (DWORD*)pBits;
+
+    // Center of the ellipse (horizontally centered)
+    int xCenter = screenWidth / 2;
+
+    // Iterate through each pixel and adjust its alpha based on distance from the ellipse.
+    for (int y = 0; y < screenHeight; y++) {
+        for (int x = 0; x < screenWidth; x++) {
+            int dx = x - xCenter;
+            int dy = y - yCenter;
+            // Apply horizontal stretching: multiply dx by horizontalEllipseFactor.
+            float effectiveDistance = sqrtf((dx * horizontalEllipseFactor) * (dx * horizontalEllipseFactor) + dy * dy);
+            BYTE alpha = 255; // Fully opaque by default.
+            if (effectiveDistance < scanRadius) {
+                alpha = 0; // Fully transparent in the inner ellipse.
+            }
+            else if (effectiveDistance < scanRadius + gradientSize) {
+                float factor = (effectiveDistance - scanRadius) / gradientSize; // 0.0 to 1.0 across the gradient.
+                alpha = (BYTE)(255 * factor);
+            }
+            pixels[y * screenWidth + x] = (alpha << 24); // ARGB: using only alpha (RGB = 0, i.e. black).
+        }
+    }
+
+    // Update the layered window with our custom bitmap.
+    HDC hdcWindow = GetDC(hwnd);
+    POINT ptSrc = { 0, 0 };
+    SIZE size = { screenWidth, screenHeight };
+    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+
+    UpdateLayeredWindow(hwnd, hdcWindow, NULL, &size, hdc, &ptSrc, 0, &blend, ULW_ALPHA);
+
+    ReleaseDC(hwnd, hdcWindow);
+    DeleteDC(hdc);
+    ReleaseDC(NULL, hdcScreen);
+}
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+    WNDCLASSEX wc = { sizeof(WNDCLASSEX), 0, WndProc, 0, 0, hInstance, NULL, LoadCursor(NULL, IDC_ARROW), NULL, NULL, g_szClassName, NULL };
+
+    if (!RegisterClassEx(&wc)) {
+        MessageBox(NULL, "Window Registration Failed!", "Error!", MB_ICONEXCLAMATION | MB_OK);
+        return 0;
+    }
+
+    screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    
+    int stepSize = screenHeight / 2;
+
+    // Create a full-screen layered overlay window.
+    overlayHwnd = CreateWindowEx(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TRANSPARENT, g_szClassName, NULL, WS_POPUP, 0, 0, screenWidth, screenHeight, NULL, NULL, hInstance, NULL);
+
+    if (!overlayHwnd) {
+        MessageBox(NULL, "Overlay Window Creation Failed!", "Error!", MB_ICONEXCLAMATION | MB_OK);
+        return 0;
+    }
+
+    ShowWindow(overlayHwnd, nCmdShow);
+
+    // Set up for vertical sync.
+    D3DKMT_WAITFORVERTICALBLANKEVENT we;
+    D3DKMT_OPENADAPTERFROMHDC oa;
+    oa.hDc = GetDC(overlayHwnd);
+    NTSTATUS result = D3DKMTOpenAdapterFromHdc(&oa);
+
+    if (result != 0) { // You can also check against STATUS_SUCCESS if defined.
+        MessageBox(NULL, "D3DKMTOpenAdapterFromHdc failed.", "Error!", MB_ICONEXCLAMATION | MB_OK);
+        return 0;
+    }
+
+    we.hAdapter = oa.hAdapter;
+    we.hDevice = 0;
+    we.VidPnSourceId = oa.VidPnSourceId;
+
+    // Main loop.
+    MSG Msg;
+    while (!quitProgram) {
+        result = D3DKMTWaitForVerticalBlankEvent(&we);
+
+        // Change scanPosition to move the ellipse vertically.
+        scanPosition = (scanPosition + stepSize) % screenHeight;
+        UpdateGradientWindow(overlayHwnd, scanPosition + cycleOffset);
+        count++;
+        if (count >= 2)
+        {
+            if (down)
+            {
+                cycleOffset += 5;
+            }
+            else
+            {
+                cycleOffset -= 5;
+            }
+            
+            count = 0;
+        }
+        if (cycleOffset > 300)
+        {
+            down = false;
+        }
+        else if (cycleOffset < 100)
+        {
+            down = true;
+        }
+
+        while (PeekMessage(&Msg, NULL, 0, 0, PM_REMOVE) > 0) {
+            TranslateMessage(&Msg);
+            DispatchMessage(&Msg);
+        }
+    }
+
+    return Msg.wParam;
+}
